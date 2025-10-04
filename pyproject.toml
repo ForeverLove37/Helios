@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "helios-cli"
+description = "Helios - 一键式远程计算平台客户端"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Helios Project", email = "helios@example.com"}
+]
+maintainers = [
+    {name = "Helios Project", email = "helios@example.com"}
+]
+keywords = ["remote", "compute", "distributed", "docker", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "typer>=0.9.0",
+    "requests>=2.31.0",
+    "websockets>=12.0",
+    "pipreqs>=0.4.11",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=22.0.0",
+    "isort>=5.0.0",
+    "mypy>=1.0.0",
+    "pre-commit>=2.20.0",
+]
+
+[project.scripts]
+helios-cli = "helios_cli.main:app"
+remote-run = "helios_cli.main:app"
+
+[project.urls]
+Homepage = "https://github.com/ForeverLove37/Helios"
+Documentation = "https://github.com/ForeverLove37/Helios#readme"
+Repository = "https://github.com/ForeverLove37/Helios.git"
+"Bug Tracker" = "https://github.com/ForeverLove37/Helios/issues"
+
+[tool.setuptools]
+packages = ["helios_cli"]
+
+[tool.setuptools_scm]
+write_to = "helios_cli/_version.py"
+
+[tool.black]
+line-length = 88
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
