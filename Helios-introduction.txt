@@ -1,0 +1,183 @@
+### **项目名称：Helios - 一键式远程计算平台**
+
+### **第一部分：项目详细方案 (The Project Plan)**
+
+#### **一、 系统架构总览**
+
+Helios系统由三个松耦合的核心组件构成，通过标准化的接口和消息协议进行通信。
+
+1.  **Helios-CLI (客户端)**: 运行在用户本地的命令行工具，是用户与系统的唯一交互入口。
+2.  **Helios-Manager (服务端)**: 一个基于FastAPI的中心服务，负责API接收、任务管理、状态跟踪和实时日志转发。
+3.  **Helios-Worker (执行端)**: 一个基于RQ和Docker的后台进程，负责从任务队列中获取任务并创建隔离的容器来执行它们。
+
+**技术栈:**
+
+*   **客户端**: Python, `Typer` (或 `Click`), `requests`, `websockets`
+*   **服务端**: Python, `FastAPI`, `uvicorn`, `python-rq`, `redis-py`, `websockets`
+*   **底层依赖**: `Redis` (用于RQ队列和Pub/Sub), `Docker Engine`
+
+**数据流转路径:**
+
+1.  **任务提交**: `CLI` -> `HTTP POST` -> `Manager`
+2.  **任务分发**: `Manager` -> `RQ (Redis Queue)` -> `Worker`
+3.  **任务执行**: `Worker` -> `Docker Container`
+4.  **日志回传**: `Docker Container` -> `Worker` -> `Redis Pub/Sub` -> `Manager` -> `WebSocket` -> `CLI`
+
+---
+
+#### **二、 组件详细设计**
+
+##### **1. Helios-CLI (客户端 `remote-run`)**
+
+**核心职责**: 提供极致便利的用户体验，将复杂的打包、上传、监控流程自动化。
+
+**功能实现**:
+
+*   **命令解析**:
+    *   主命令 `remote-run <ENTRYPOINT_SCRIPT>`。
+    *   可选参数:
+        *   `--priority TEXT`: 任务优先级，值为`high`或`default` (默认为`default`)。
+        *   `--name TEXT`: 为任务指定一个人类可读的名称。
+        *   `--cpu-limit INTEGER`: 指定容器的CPU核心数限制。
+        *   `--mem-limit TEXT`: 指定容器的内存限制 (例如 "4g", "512m")。
+*   **依赖自动发现**:
+    *   在执行打包前，调用 `pipreqs` 库扫描项目目录，强制生成 `requirements.txt`。此步骤应静默处理，除非出错。
+*   **项目打包**:
+    *   将当前工作目录下的所有文件（遵循 `.gitignore` 规则，如果存在）压缩成一个 `.zip` 文件。
+*   **任务提交**:
+    *   构造一个 `multipart/form-data` HTTP POST请求，发送到Manager的 `/api/v1/tasks/submit` 端点。
+    *   `file` 部分包含 `.zip` 压缩包。
+    *   `metadata` 部分包含一个JSON字符串，内容为 `{ "entrypoint": "main.py", "priority": "high", "name": "my-hpc-task", "resources": {"cpu": 2, "mem": "4g"} }`。
+*   **实时日志接收**:
+    *   从提交请求的响应中获取 `task_id`。
+    *   立即使用 `task_id` 与Manager的 `/ws/logs/{task_id}` 建立WebSocket连接。
+    *   进入循环监听模式，将从WebSocket收到的每一条消息（即日志行）解码并打印到标准输出。
+    *   当收到特定的结束信号（例如 `[HELIOS_TASK_COMPLETE]` 或 `[HELIOS_TASK_FAILED]`）或WebSocket连接关闭时，程序优雅退出。
+
+##### **2. Helios-Manager (服务端)**
+
+**核心职责**: 系统的“大脑”，负责任务的生命周期管理和通信中转。
+
+**API端点设计**:
+
+*   `POST /api/v1/tasks/submit`:
+    *   **认证**: (初期可省略) 未来可通过API Key进行认证。
+    *   **输入**: `multipart/form-data`，包含`file`和`metadata`。
+    *   **处理流程**:
+        1.  生成一个全局唯一的 `task_id` (建议使用UUID)。
+        2.  在预设的工作目录（例如 `/var/helios/tasks/`）下创建一个以 `task_id` 命名的子目录。
+        3.  将上传的 `.zip` 文件解压到该目录。
+        4.  解析 `metadata`，获取任务参数。
+        5.  将任务信息（`task_id`, 任务路径, `entrypoint`, 资源限制等）作为一个作业（Job）推送到RQ中对应的优先级队列 (`high` 或 `default`)。
+        6.  在Redis中为该 `task_id` 初始化一个状态（例如 `status:pending`）。
+    *   **输出**: `JSON`, `{ "success": true, "task_id": "...", "message": "Task submitted successfully." }`。
+*   `WebSocket /ws/logs/{task_id}`:
+    *   **输入**: 客户端通过路径参数 `task_id` 建立连接。
+    *   **处理流程**:
+        1.  接受WebSocket连接。
+        2.  启动一个后台任务（协程），该任务订阅Redis Pub/Sub中名为 `logs:{task_id}` 的频道。
+        3.  当从该频道收到消息时，立即通过WebSocket将消息转发给客户端。
+        4.  监听连接断开事件，断开时自动取消订阅并清理资源。
+
+##### **3. Helios-Worker (执行端)**
+
+**核心职责**: 无状态的执行单元，消费任务并与Docker交互。
+
+**启动方式**: 通过 `rq worker high default` 命令启动，监听两个队列。
+
+**核心任务函数 `run_task_in_docker(job_info)`**:
+
+*   **输入**: 一个包含所有任务信息的字典 `job_info`，例如 `{ "task_id": ..., "task_path": ..., "entrypoint": ..., "resources": ... }`。
+*   **处理流程**:
+    1.  **状态更新**: 连接Redis，将 `task_id` 的状态更新为 `status:running`。
+    2.  **日志发布器**: 初始化一个Redis连接，用于后续发布日志。
+    3.  **构造Docker命令**:
+        *   动态地根据 `job_info` 中的资源限制参数构建 `docker run` 命令字符串。
+        *   必须包含 `--rm` 以便自动清理。
+        *   必须将 `task_path` 挂载到容器的 `/app` 目录 (`-v {task_path}:/app`)。
+        *   工作目录设置为 `/app` (`-w /app`)。
+        *   执行的命令为 `sh -c "pip install -r requirements.txt && python -u {entrypoint}"`。`-u` 参数至关重要，用于禁用输出缓冲。
+    4.  **执行与日志流式处理**:
+        *   使用 `subprocess.Popen` 启动Docker进程，并捕获其 `stdout` 和 `stderr`。
+        *   逐行读取子进程的输出流。
+        *   对于每一行日志，通过Redis `PUBLISH` 命令将其发送到 `logs:{task_id}` 频道。
+    5.  **任务收尾**:
+        *   等待子进程结束，获取其返回码。
+        *   根据返回码，决定最终状态（`succeeded` 或 `failed`）。
+        *   向 `logs:{task_id}` 频道发布一个特殊的任务结束信号，例如 `[HELIOS_TASK_COMPLETE]` 或 `[HELIOS_TASK_FAILED:{return_code}]`。
+        *   更新Redis中 `task_id` 的最终状态。
+        *   **清理**: 执行 `finally` 块，确保任务的工作目录 `/var/helios/tasks/{task_id}` 被递归删除，以释放磁盘空间。
+
+---
+
+### **第二部分：面向LLM Agent的开发规范 (Development Specification)**
+
+**Agent任务**: 你是一个专业的Python后端工程师，你需要根据上述方案，实现Helios项目。在开发过程中，你必须严格遵守以下规范。
+
+#### **A. 通用原则 (General Principles)**
+
+1.  **模块化与单一职责**: 严格分离组件。`api.py` 只处理HTTP请求，`tasks.py` 只定义RQ任务，`websocket.py` 只管理WebSocket连接。避免创建包含所有功能的“上帝模块”。
+2.  **配置驱动**: 严禁在代码中硬编码任何配置项（如Redis主机、端口、任务存储路径）。所有配置项必须定义在一个独立的 `core/config.py` 文件中，并通过环境变量或 `.env` 文件进行加载。
+3.  **强类型**: 必须为所有函数签名和Pydantic模型使用Python类型提示（Type Hinting）。这是强制性要求。
+4.  **全面的错误处理**: 必须对所有可能失败的操作（文件IO、网络请求、子进程调用）进行 `try...except` 包装，并提供有意义的日志记录。
+5.  **日志记录**: 系统自身需要有结构化的日志。使用Python的 `logging` 模块。Manager和Worker的日志应明确区分，并包含时间戳、日志级别和模块名。
+
+#### **B. 组件特定规范 (Component-Specific Guidelines)**
+
+1.  **Helios-CLI**:
+    *   必须使用 `Typer` 或 `Click` 库构建，以生成标准的命令行界面。
+    *   必须向用户提供清晰的进度反馈，例如 "正在分析依赖...", "项目打包中...", "已上传，等待服务器响应...", "连接到实时日志流..."。
+    *   必须优雅地处理API请求失败和WebSocket连接中断的情况，并向用户显示友好的错误信息。
+
+2.  **Helios-Manager (FastAPI)**:
+    *   必须使用Pydantic模型来定义所有API请求体和响应体，以实现自动数据校验和文档生成。
+    *   必须使用FastAPI的 `Depends` 系统来管理Redis连接等共享资源。
+    *   API路由应使用 `APIRouter` 进行组织，按功能划分到不同文件（例如 `routers/tasks.py`）。
+
+3.  **Helios-Worker (RQ)**:
+    *   任务函数 (`run_task_in_docker`) 必须是独立的、可导入的函数。
+    *   任务函数内部不应包含任何与FastAPI应用相关的逻辑。它只与Redis和Docker交互。
+    *   必须在 `finally` 块中执行清理操作（如删除临时文件目录），以确保即使任务失败，系统资源也能被回收。
+
+#### **C. 代码与风格 (Code and Style)**
+
+1.  **PEP 8**: 所有代码必须严格遵守PEP 8编码规范。
+2.  **文档字符串 (Docstrings)**: 所有模块、类和公共函数必须有符合Google风格或Numpy风格的Docstring，清晰地描述其功能、参数和返回值。
+3.  **常量定义**: 避免使用“魔法字符串”。队列名称 (`high`, `default`)、Redis频道命名前缀 (`logs:`)、任务状态 (`pending`, `running`)等，都应该在 `core/constants.py` 中定义为常量。
+
+#### **D. 建议项目结构 (Recommended Project Structure)**
+
+请遵循以下目录结构来组织项目代码：
+
+```
+helios-project/
+├── helios_cli/
+│   └── main.py                 # Typer/Click CLI application
+│
+├── helios_server/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py             # FastAPI app object and startup events
+│   │   ├── api/
+│   │   │   ├── __init__.py
+│   │   │   └── tasks.py        # Router for task submission
+│   │   ├── websocket/
+│   │   │   ├── __init__.py
+│   │   │   └── manager.py      # WebSocket connection manager and log forwarder
+│   │   ├── worker/
+│   │   │   ├── __init__.py
+│   │   │   └── tasks.py        # RQ task function definitions (e.g., run_task_in_docker)
+│   │   └── core/
+│   │       ├── __init__.py
+│   │       ├── config.py       # Configuration loading
+│   │       └── constants.py    # Project-wide constants
+│   │
+│   ├── run_server.sh           # Script to start uvicorn
+│   └── run_worker.sh           # Script to start rq worker
+│
+├── .env.example                # Example environment variables
+├── .gitignore
+├── docker-compose.yml          # For running Redis and potentially the app
+└── README.md                   # Project documentation
+```
+
